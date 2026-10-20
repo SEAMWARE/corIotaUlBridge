@@ -1,0 +1,207 @@
+#
+# FILE            iotaul_commands.test
+#
+# Copyright 2026 Seamware
+# SPDX-License-Identifier: Apache-2.0
+#
+# The IoT Agent UltraLight's commands as Service Executions (coraine doc/iot-agent-executor.md). A Service
+# Registration per command, its endpoint the delivery; invoking the service sends the device
+# <deviceId>@<cmd>|<input.value> - an object value as <deviceId>@<cmd>|<key>=<value>|... - and the device's
+# answer, <deviceId>@<cmd>|<result>, completes the execution, the result its output.
+#
+#   iota-ul+mqtt://<apikey>/<deviceId>/<cmd>                  published on /<apikey>/<deviceId>/cmd, answered
+#                                                             on .../cmdexe
+#   iota-ul+http://<host>/<path>?cmd=<cmd>&device=<deviceId>  POSTed as text/plain; the 200 response is the
+#                                                             answer
+#
+# A device answering 500 fails the execution; one that never answers fails it at the registration's
+# executionTimeout. device.py plays the devices, over a private mosquitto.
+#
+--NAME--
+iotaul - device commands as Service Executions, over MQTT and HTTP
+
+--TAGS--
+iotaul service
+
+--INIT--
+rm -rf "${IOTAUL_TEST_DIR:?}"
+mkdir -p "$IOTAUL_TEST_DIR"
+printf 'listener 11885\nallow_anonymous true\n' > "$IOTAUL_TEST_DIR/mosquitto.conf"
+nohup mosquitto -c "$IOTAUL_TEST_DIR/mosquitto.conf" > "$IOTAUL_TEST_DIR/mosquitto.log" 2>&1 &
+echo $! > "$IOTAUL_TEST_DIR/mosquitto.pid"
+for i in $(seq 1 50); do (echo > /dev/tcp/localhost/11885) 2>/dev/null && break; sleep 0.1; done
+nohup python3 "$REPO_ROOT/test/funcTests/device.py" 11885 17895 "$IOTAUL_TEST_DIR/device.log" > "$IOTAUL_TEST_DIR/device.out" 2>&1 &
+echo $! > "$IOTAUL_TEST_DIR/device.pid"
+for i in $(seq 1 50); do grep -q READY "$IOTAUL_TEST_DIR/device.log" 2>/dev/null && break; sleep 0.1; done
+echo '{ "iotaul": { "server": { "uri": "mqtt://localhost:11885" } } }' > "$IOTAUL_TEST_DIR/bridges.json"
+brokerStart
+
+--RUN--
+B="http://localhost:$IOTAUL_PORT/ngsi-ld/v1"
+
+reg() {  # reg <entityId> <endpoint> [executionTimeout]
+  local t=""
+  [ -n "$3" ] && t=",\"executionTimeout\":\"$3\""
+  curl -s -o /dev/null -w "%{http_code}\n" "$B/serviceRegistrations" -H 'Content-Type: application/json' \
+       -d "{\"type\":\"ServiceRegistration\",\"endpoint\":\"$2\",\"entities\":[{\"id\":\"$1\",\"type\":\"Lamp\"}],\"serviceInformation\":{\"serviceName\":\"switch\",\"mode\":\"asynchronous\"}$t}"
+}
+invoke() {  # invoke <entityId> <value> [<JSON value>] - the status, and the execution's id in $IOTAUL_TEST_DIR/exec
+  local v="\"$2\""
+  [ -n "$3" ] && v="$3"
+  curl -s -i "$B/entities/$1/services/switch" -H 'Content-Type: application/json' -d "{\"value\": $v}" > "$IOTAUL_TEST_DIR/invoke.out"
+  head -1 "$IOTAUL_TEST_DIR/invoke.out" | tr -d '\r'
+  grep -i '^Service-Execution:' "$IOTAUL_TEST_DIR/invoke.out" | awk '{print $2}' | tr -d '\r' > "$IOTAUL_TEST_DIR/exec"
+}
+awaitEnd() {  # awaitEnd [seconds] - the execution's status, output and error once it has ended
+  local id; id=$(cat "$IOTAUL_TEST_DIR/exec")
+  for i in $(seq 1 $((${1:-5} * 10))); do
+    curl -s "$B/services/$id" | grep -q '"executionStatus": *"\(completed\|failed\|cancelled\)"' && break
+    sleep 0.1
+  done
+  curl -s "$B/services/$id" | python3 -c "
+import json, sys
+e = json.load(sys.stdin)
+print(e['executionStatus'], 'output', json.dumps(e.get('executionOutput')), 'error', json.dumps((e.get('executionError') or {}).get('detail')))"
+}
+device() { grep -v READY "$IOTAUL_TEST_DIR/device.log"; : > "$IOTAUL_TEST_DIR/device.log"; }
+
+for l in lamp1 lamp2 lamp3 lamp4 lamp5 lamp6; do
+  curl -s -o /dev/null "$B/entities" -H 'Content-Type: application/json' -d "{\"id\":\"urn:ngsi-ld:Lamp:$l\",\"type\":\"Lamp\"}"
+done
+
+echo "01. A Service Registration per lamp's command - MQTT, HTTP, HTTP to a failing device, a silent device, two bad endpoints"
+echo "========================================================================================================================"
+reg urn:ngsi-ld:Lamp:lamp1 "iota-ul+mqtt://lamp-key/lamp1/switch"
+reg urn:ngsi-ld:Lamp:lamp2 "iota-ul+http://localhost:17895/lamps/lamp2?cmd=switch&device=lamp2"
+reg urn:ngsi-ld:Lamp:lamp3 "iota-ul+http://localhost:17895/fail/lamp3?cmd=switch&device=lamp3"
+reg urn:ngsi-ld:Lamp:lamp4 "iota-ul+mqtt://silent/lamp4/switch" PT1S
+reg urn:ngsi-ld:Lamp:lamp5 "iota-ul+mqtt://only-a-key"
+reg urn:ngsi-ld:Lamp:lamp6 "iota-ul+http://localhost:17895/lamps/lamp6?cmd=switch"
+echo
+echo
+
+
+echo "02. Switch lamp1 on, over MQTT - the device gets lamp1@switch|on on /lamp-key/lamp1/cmd; its cmdexe completes the execution"
+echo "==========================================================================================================================="
+invoke urn:ngsi-ld:Lamp:lamp1 on
+awaitEnd
+device
+echo
+echo
+
+
+echo "03. An object value, and a number - lamp1@switch|color=red|level=3, lamp1@switch|42"
+echo "==================================================================================="
+invoke urn:ngsi-ld:Lamp:lamp1 x '{"color": "red", "level": 3}'
+awaitEnd
+invoke urn:ngsi-ld:Lamp:lamp1 x '42'
+awaitEnd
+device
+echo
+echo
+
+
+echo "04. Switch lamp2 on, over HTTP - POSTed to the device as text/plain; its response completes the execution"
+echo "========================================================================================================="
+invoke urn:ngsi-ld:Lamp:lamp2 on
+awaitEnd
+device
+echo
+echo
+
+
+echo "05. Switch lamp3 on - the device answers 500 lamp3@switch|broken: failed, the result in the error"
+echo "================================================================================================="
+invoke urn:ngsi-ld:Lamp:lamp3 on
+awaitEnd
+device
+echo
+echo
+
+
+echo "06. Switch lamp4 on - the device never answers: failed at the registration's executionTimeout, PT1S"
+echo "==================================================================================================="
+invoke urn:ngsi-ld:Lamp:lamp4 on
+awaitEnd 10
+device
+echo
+echo
+
+
+echo "07. Switch lamp5 on - its endpoint names no device: 400; lamp6 - its HTTP endpoint names no device (device=): 400"
+echo "================================================================================================================="
+invoke urn:ngsi-ld:Lamp:lamp5 on
+invoke urn:ngsi-ld:Lamp:lamp6 on
+echo
+echo
+
+
+--TEARDOWN--
+brokerStop
+#
+# The device and mosquitto, by pid - and gone before this returns: the next test's INIT binds 11885 again
+#
+for f in device mosquitto; do
+  [ -f "$IOTAUL_TEST_DIR/$f.pid" ] || continue
+  pid=$(cat "$IOTAUL_TEST_DIR/$f.pid")
+  kill "$pid" 2>/dev/null
+  for i in $(seq 1 50); do kill -0 "$pid" 2>/dev/null || break; sleep 0.1; done
+done
+true
+
+
+--EXPECT--
+01. A Service Registration per lamp's command - MQTT, HTTP, HTTP to a failing device, a silent device, two bad endpoints
+========================================================================================================================
+201
+201
+201
+201
+201
+201
+
+
+02. Switch lamp1 on, over MQTT - the device gets lamp1@switch|on on /lamp-key/lamp1/cmd; its cmdexe completes the execution
+===========================================================================================================================
+HTTP/1.1 202 Accepted
+completed output "on done" error null
+MQTT /lamp-key/lamp1/cmd lamp1@switch|on
+
+
+03. An object value, and a number - lamp1@switch|color=red|level=3, lamp1@switch|42
+===================================================================================
+HTTP/1.1 202 Accepted
+completed output "color=red" error null
+HTTP/1.1 202 Accepted
+completed output "42 done" error null
+MQTT /lamp-key/lamp1/cmd lamp1@switch|color=red|level=3
+MQTT /lamp-key/lamp1/cmd lamp1@switch|42
+
+
+04. Switch lamp2 on, over HTTP - POSTed to the device as text/plain; its response completes the execution
+=========================================================================================================
+HTTP/1.1 202 Accepted
+completed output "on done" error null
+HTTP /lamps/lamp2 text/plain lamp2@switch|on
+
+
+05. Switch lamp3 on - the device answers 500 lamp3@switch|broken: failed, the result in the error
+=================================================================================================
+HTTP/1.1 202 Accepted
+failed output null error "the device answered 500: broken"
+HTTP /fail/lamp3 text/plain lamp3@switch|on
+
+
+06. Switch lamp4 on - the device never answers: failed at the registration's executionTimeout, PT1S
+===================================================================================================
+HTTP/1.1 202 Accepted
+failed output null error "the service's execution did not end within its executionTimeout"
+MQTT /silent/lamp4/cmd lamp4@switch|on
+
+
+07. Switch lamp5 on - its endpoint names no device: 400; lamp6 - its HTTP endpoint names no device (device=): 400
+=================================================================================================================
+HTTP/1.1 400 Bad Request
+HTTP/1.1 400 Bad Request
+
+

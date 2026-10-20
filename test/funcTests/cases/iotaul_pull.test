@@ -1,0 +1,202 @@
+#
+# FILE            iotaul_pull.test
+#
+# Copyright 2026 Seamware
+# SPDX-License-Identifier: Apache-2.0
+#
+# Pull commands (coraine doc/iot-agent-executor.md): a Service Registration whose endpoint is
+# iota-ul+poll://<apikey>/<deviceId>/<cmd> - invoking it stores the command; the device asks for its
+# commands on the southbound port, as it asks iotagent-ul:
+#
+#   GET  /iot/d?k=<apikey>&i=<deviceId>&getCmd=1   <deviceId>@<cmd>|<value>|<deviceId>@<cmd2>|<value> - delivered
+#   POST /iot/d?k=<apikey>&i=<deviceId>            <deviceId>@<cmd>|<result>                          - the
+#                                                  execution completed, its output the result as text
+#
+# curl plays the device. A command not yet asked for can be cancelled; the southbound port answers
+# iotagent-ul's errors.
+#
+--NAME--
+iotaul - pull commands over the southbound port
+
+--TAGS--
+iotaul service
+
+--INIT--
+rm -rf "${IOTAUL_TEST_DIR:?}"
+mkdir -p "$IOTAUL_TEST_DIR"
+echo '{ "iotaul": { "southbound": { "port": 17894 } } }' > "$IOTAUL_TEST_DIR/bridges.json"
+brokerStart
+
+--RUN--
+B="http://localhost:$IOTAUL_PORT/ngsi-ld/v1"
+S="http://localhost:17894"
+
+reg() {  # reg <entityId> <serviceName> <endpoint>
+  curl -s -o /dev/null -w "%{http_code}\n" "$B/serviceRegistrations" -H 'Content-Type: application/json' \
+       -d "{\"type\":\"ServiceRegistration\",\"endpoint\":\"$3\",\"entities\":[{\"id\":\"$1\",\"type\":\"Lamp\"}],\"serviceInformation\":{\"serviceName\":\"$2\",\"mode\":\"asynchronous\"}}"
+}
+invoke() {  # invoke <entityId> <serviceName> <value> <file> - the status; the execution's id in <file>
+  curl -s -i "$B/entities/$1/services/$2" -H 'Content-Type: application/json' -d "{\"value\": \"$3\"}" > "$IOTAUL_TEST_DIR/invoke.out"
+  head -1 "$IOTAUL_TEST_DIR/invoke.out" | tr -d '\r'
+  grep -i '^Service-Execution:' "$IOTAUL_TEST_DIR/invoke.out" | awk '{print $2}' | tr -d '\r' > "$IOTAUL_TEST_DIR/$4"
+}
+execution() {  # execution <file> - its status, progress and output
+  curl -s "$B/services/$(cat "$IOTAUL_TEST_DIR/$1")" | python3 -c "
+import json, sys
+e = json.load(sys.stdin)
+print(e['executionStatus'], 'progress', json.dumps(e.get('executionProgress')), 'output', json.dumps(e.get('executionOutput')))"
+}
+south() {  # south <curl args> - the status and the body
+  curl -s -w "\n%{http_code}\n" "$@"
+}
+
+for l in lamp1 lamp2; do
+  curl -s -o /dev/null "$B/entities" -H 'Content-Type: application/json' -d "{\"id\":\"urn:ngsi-ld:Lamp:$l\",\"type\":\"Lamp\"}"
+done
+
+echo "01. Two pull commands of lamp1 (switch, blink), one of lamp2"
+echo "============================================================"
+reg urn:ngsi-ld:Lamp:lamp1 switch "iota-ul+poll://lamp-key/lamp1/switch"
+reg urn:ngsi-ld:Lamp:lamp1 blink  "iota-ul+poll://lamp-key/lamp1/blink"
+reg urn:ngsi-ld:Lamp:lamp2 switch "iota-ul+poll://lamp-key/lamp2/switch"
+echo
+echo
+
+
+echo "02. Switch lamp1 on, make it blink - stored: executing, not delivered"
+echo "====================================================================="
+invoke urn:ngsi-ld:Lamp:lamp1 switch on   exec1
+invoke urn:ngsi-ld:Lamp:lamp1 blink  fast exec2
+execution exec1
+execution exec2
+echo
+echo
+
+
+echo "03. lamp1 asks for its commands - both, joined by '|'; both delivered"
+echo "====================================================================="
+south "$S/iot/d?k=lamp-key&i=lamp1&getCmd=1"
+execution exec1
+execution exec2
+echo
+echo
+
+
+echo "04. lamp1 asks again - nothing left: an empty body"
+echo "=================================================="
+south "$S/iot/d?k=lamp-key&i=lamp1&getCmd=1"
+echo
+echo
+
+
+echo "05. lamp1 answers switch - that execution completed, its output the result; blink still executing"
+echo "================================================================================================="
+south "$S/iot/d?k=lamp-key&i=lamp1" -H 'Content-Type: text/plain' -d 'lamp1@switch|on done'
+sleep 0.2
+execution exec1
+execution exec2
+echo
+echo
+
+
+echo "06. Switch lamp2 on, then cancel it before lamp2 asks - cancelled; lamp2 then gets nothing"
+echo "=========================================================================================="
+invoke urn:ngsi-ld:Lamp:lamp2 switch on exec3
+curl -s -o /dev/null -w "%{http_code}\n" -X DELETE "$B/services/$(cat "$IOTAUL_TEST_DIR/exec3")"
+execution exec3
+south "$S/iot/d?k=lamp-key&i=lamp2&getCmd=1"
+echo
+echo
+
+
+echo "07. Cancel lamp1's blink, delivered already - 409"
+echo "================================================="
+curl -s -o /dev/null -w "%{http_code}\n" -X DELETE "$B/services/$(cat "$IOTAUL_TEST_DIR/exec2")"
+execution exec2
+echo
+echo
+
+
+echo "08. The southbound port's errors, as iotagent-ul's - no k nor i, no payload, not text/plain, a measure of no DataChannel, another path"
+echo "======================================================================================================================================"
+south "$S/iot/d?getCmd=1"
+south "$S/iot/d?k=lamp-key&i=lamp1"
+south "$S/iot/d?k=lamp-key&i=lamp1" -H 'Content-Type: application/json' -d 't|21'
+south "$S/iot/d?k=lamp-key&i=lamp1" -H 'Content-Type: text/plain' -d 't|21'
+south "$S/iot/json?k=lamp-key&i=lamp1&getCmd=1"
+echo
+echo
+
+
+--TEARDOWN--
+brokerStop
+true
+
+
+--EXPECT--
+01. Two pull commands of lamp1 (switch, blink), one of lamp2
+============================================================
+201
+201
+201
+
+
+02. Switch lamp1 on, make it blink - stored: executing, not delivered
+=====================================================================
+HTTP/1.1 202 Accepted
+HTTP/1.1 202 Accepted
+executing progress null output null
+executing progress null output null
+
+
+03. lamp1 asks for its commands - both, joined by '|'; both delivered
+=====================================================================
+lamp1@switch|on|lamp1@blink|fast
+200
+executing progress {"delivered": true} output null
+executing progress {"delivered": true} output null
+
+
+04. lamp1 asks again - nothing left: an empty body
+==================================================
+
+200
+
+
+05. lamp1 answers switch - that execution completed, its output the result; blink still executing
+=================================================================================================
+
+200
+completed progress {"delivered": true} output "on done"
+executing progress {"delivered": true} output null
+
+
+06. Switch lamp2 on, then cancel it before lamp2 asks - cancelled; lamp2 then gets nothing
+==========================================================================================
+HTTP/1.1 202 Accepted
+204
+cancelled progress null output null
+
+200
+
+
+07. Cancel lamp1's blink, delivered already - 409
+=================================================
+409
+executing progress {"delivered": true} output null
+
+
+08. The southbound port's errors, as iotagent-ul's - no k nor i, no payload, not text/plain, a measure of no DataChannel, another path
+======================================================================================================================================
+{"name":"MANDATORY_PARAMS_NOT_FOUND","message":"Some of the mandatory params weren't found in the request: [\"API Key\",\"Device Id\"]"}
+400
+{"name":"MANDATORY_PARAMS_NOT_FOUND","message":"Some of the mandatory params weren't found in the request: [\"Payload\"]"}
+400
+{"name":"UNSUPPORTED_TYPE","message":"The request content didn't have the expected type [text/plain ]"}
+400
+{"name":"DEVICE_GROUP_NOT_FOUND","message":"Couldn't find device group for apikey lamp-key"}
+404
+{"name":"NOT_FOUND","message":"no such resource"}
+404
+
+
