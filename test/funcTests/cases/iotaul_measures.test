@@ -1,0 +1,284 @@
+#
+# FILE            iotaul_measures.test
+#
+# Copyright 2026 Seamware
+# SPDX-License-Identifier: Apache-2.0
+#
+# UltraLight 2.0 measures as DataChannel records (coraine doc/iot-agent-measures.md): a measure group
+# <key>|<value>|... is a record - its keys, each value JSON when it is JSON, else a string, plus @deviceId
+# and @apikey - handed to the broker on the device's DataChannel (<apikey>/<deviceId>), else its group's
+# (<apikey>); the DataChannel's mapping makes the entity. A payload with a group that is not a measure is refused
+# whole (PARSE_ERROR) - but 't|99|h' is one: two bars, so 't' is its timestamp, as iotagent-ul reads it.
+#
+#   th-key/th1   a device's own DataChannel: 't' as temperature (a number), the bridge's otherColumns
+#                "property" - every other key an attribute
+#   grp-key      a group's: the entity id from @deviceId, the scope /garden
+#
+# A group after a timestamp (an even number of bars) has that time; groups split by '#' are one record each,
+# in time order; the 't' parameter is every group's time. On the southbound port, as iotagent-ul's: POST
+# /iot/d (text/plain) and GET /iot/d?d=, and the errors - DEVICE_GROUP_NOT_FOUND, DEVICE_NOT_FOUND,
+# PARSE_ERROR. Over MQTT: [/][ul/]<apikey>/<deviceId>/attrs (UltraLight) and .../attrs/<name> (one value).
+#
+--NAME--
+iotaul - UltraLight measures as DataChannel records, over HTTP and MQTT
+
+--TAGS--
+iotaul measures
+
+--INIT--
+rm -rf "${IOTAUL_TEST_DIR:?}"
+mkdir -p "$IOTAUL_TEST_DIR"
+printf 'listener 11885\nallow_anonymous true\n' > "$IOTAUL_TEST_DIR/mosquitto.conf"
+nohup mosquitto -c "$IOTAUL_TEST_DIR/mosquitto.conf" > "$IOTAUL_TEST_DIR/mosquitto.log" 2>&1 &
+echo $! > "$IOTAUL_TEST_DIR/mosquitto.pid"
+for i in $(seq 1 50); do (echo > /dev/tcp/localhost/11885) 2>/dev/null && break; sleep 0.1; done
+cat > "$IOTAUL_TEST_DIR/bridges.json" <<EOF
+{
+  "iotaul": {
+    "server":     { "uri": "mqtt://localhost:11885" },
+    "southbound": { "port": 17894 },
+    "ngsild": {
+      "defaultEntity": false,
+      "otherColumns": "property",
+      "dataChannels": {
+        "th-key/th1": { "entities": [ { "type": "Thermometer", "id": "urn:ngsi-ld:Thermometer:th1",
+                                        "attributes": { "temperature": { "column": "t", "as": "number", "unitCode": "CEL" } } } ] },
+        "grp-key":    { "entities": [ { "type": "Sensor", "id": "urn:ngsi-ld:Sensor:{@deviceId}", "scope": "/garden",
+                                        "attributes": { "temperature": { "column": "t", "as": "number" } } } ] }
+      }
+    }
+  }
+}
+EOF
+brokerStart
+
+--RUN--
+B="http://localhost:$IOTAUL_PORT/ngsi-ld/v1"
+S="http://localhost:17894"
+
+south() {  # south <curl args> - the body and the status
+  curl -s -w "\n%{http_code}\n" "$@"
+}
+ul() {  # ul <url> <measure> - POSTed as text/plain: the body and the status
+  south "$1" -H 'Content-Type: text/plain' -d "$2"
+}
+entity() {  # entity <id> - the entity, its attributes' observedAt included
+  curl -s "$B/entities/$1"
+  echo
+}
+mqttPub() {  # mqttPub <topic> <payload>
+  python3 -c "
+import sys, paho.mqtt.publish as p
+p.single(sys.argv[1], sys.argv[2], qos=1, hostname='localhost', port=11885)" "$1" "$2"
+}
+await() {  # await <id> <text> - until the entity's body has the text (5 s)
+  local i
+  for i in $(seq 1 50); do curl -s "$B/entities/$1" | grep -q -- "$2" && return 0; sleep 0.1; done
+  echo "await: $1 never had $2"
+}
+
+echo "01. POST /iot/d - th1's own DataChannel: 't' its temperature, 'h' and 's' other columns (40 a number, 'ok' a string)"
+echo "===================================================================================================================="
+south "$S/iot/d?k=th-key&i=th1&t=2026-10-20T21:00:00.000Z" -H 'Content-Type: text/plain' -d 't|21.5|h|40|s|ok'
+entity urn:ngsi-ld:Thermometer:th1
+echo
+echo
+
+
+echo "02. A group after a timestamp - its time the observedAt; no Content-Type is text/plain"
+echo "======================================================================================"
+south "$S/iot/d?k=th-key&i=th1" -H 'Content-Type:' -d '2026-10-20T21:05:00.000Z|t|22'
+curl -s "$B/entities/urn:ngsi-ld:Thermometer:th1?pick=temperature"
+echo
+echo
+echo
+
+
+echo "03. Groups split by '#' - one record each, in time order: the latest (the first group) stays"
+echo "============================================================================================"
+ul "$S/iot/d?k=th-key&i=th1" '2026-10-20T21:10:00.000Z|t|30#2026-10-20T21:08:00.000Z|t|25'
+curl -s "$B/entities/urn:ngsi-ld:Thermometer:th1?pick=temperature"
+echo
+echo
+echo
+
+
+echo "04. GET /iot/d?d= - and 't' as every group's time, over the group's own timestamp"
+echo "================================================================================="
+south "$S/iot/d?k=th-key&i=th1&t=2026-10-20T22:00:00.000Z&d=2026-10-20T00:00:00.000Z%7Ct%7C18"
+curl -s "$B/entities/urn:ngsi-ld:Thermometer:th1?pick=temperature"
+echo
+echo
+echo
+
+
+echo "05. A group's DataChannel - two devices of grp-key, each its own entity"
+echo "======================================================================="
+ul "$S/iot/d?k=grp-key&i=s1&t=2026-10-20T22:02:00.000Z" 't|10'
+ul "$S/iot/d?k=grp-key&i=s2&t=2026-10-20T22:02:00.000Z" 't|11'
+entity urn:ngsi-ld:Sensor:s1
+entity urn:ngsi-ld:Sensor:s2
+echo
+echo
+
+
+echo "06. The errors - no group, a group's devices but not this one, a group with a key and no value, an empty value - nothing stored (18)"
+echo "===================================================================================================================================="
+ul "$S/iot/d?k=nokey&i=x" 't|1'
+ul "$S/iot/d?k=th-key&i=th9" 't|1'
+ul "$S/iot/d?k=th-key&i=th1" 't|99#h'
+ul "$S/iot/d?k=th-key&i=th1" 't|99|h|'
+curl -s "$B/entities/urn:ngsi-ld:Thermometer:th1?pick=temperature" | grep '"value"'
+echo
+echo
+
+
+echo "07. MQTT - /<apikey>/<deviceId>/attrs (UltraLight), ul/<apikey>/<deviceId>/attrs/<name> (one value, a string)"
+echo "============================================================================================================="
+mqttPub /th-key/th1/attrs '2026-10-20T23:00:00.000Z|t|5'
+await urn:ngsi-ld:Thermometer:th1 '"value": 5'
+mqttPub ul/grp-key/s3/attrs/t '7'
+await urn:ngsi-ld:Sensor:s3 '"value": 7'
+mqttPub /ul/grp-key/s3/attrs/note 'all fine'
+await urn:ngsi-ld:Sensor:s3 'all fine'
+curl -s "$B/entities/urn:ngsi-ld:Thermometer:th1?pick=temperature" | grep -E '"value"|observedAt'
+curl -s "$B/entities/urn:ngsi-ld:Sensor:s3?pick=temperature,note,scope" | grep -E '"value"|scope'
+echo
+echo
+
+
+--TEARDOWN--
+brokerStop
+if [ -f "$IOTAUL_TEST_DIR/mosquitto.pid" ]; then
+  pid=$(cat "$IOTAUL_TEST_DIR/mosquitto.pid")
+  kill "$pid" 2>/dev/null
+  for i in $(seq 1 50); do kill -0 "$pid" 2>/dev/null || break; sleep 0.1; done
+fi
+true
+
+
+--EXPECT--
+01. POST /iot/d - th1's own DataChannel: 't' its temperature, 'h' and 's' other columns (40 a number, 'ok' a string)
+====================================================================================================================
+
+200
+{
+  "id": "urn:ngsi-ld:Thermometer:th1",
+  "type": "Thermometer",
+  "temperature": {
+    "type": "Property",
+    "value": 21.5,
+    "unitCode": "CEL",
+    "observedAt": "2026-10-20T21:00:00Z"
+  },
+  "h": {
+    "type": "Property",
+    "value": 40,
+    "observedAt": "2026-10-20T21:00:00Z"
+  },
+  "s": {
+    "type": "Property",
+    "value": "ok",
+    "observedAt": "2026-10-20T21:00:00Z"
+  }
+}
+
+
+
+02. A group after a timestamp - its time the observedAt; no Content-Type is text/plain
+======================================================================================
+
+200
+{
+  "temperature": {
+    "type": "Property",
+    "value": 22,
+    "unitCode": "CEL",
+    "observedAt": "2026-10-20T21:05:00Z"
+  }
+}
+
+
+
+03. Groups split by '#' - one record each, in time order: the latest (the first group) stays
+============================================================================================
+
+200
+{
+  "temperature": {
+    "type": "Property",
+    "value": 30,
+    "unitCode": "CEL",
+    "observedAt": "2026-10-20T21:10:00Z"
+  }
+}
+
+
+
+04. GET /iot/d?d= - and 't' as every group's time, over the group's own timestamp
+=================================================================================
+
+200
+{
+  "temperature": {
+    "type": "Property",
+    "value": 18,
+    "unitCode": "CEL",
+    "observedAt": "2026-10-20T22:00:00Z"
+  }
+}
+
+
+
+05. A group's DataChannel - two devices of grp-key, each its own entity
+=======================================================================
+
+200
+
+200
+{
+  "id": "urn:ngsi-ld:Sensor:s1",
+  "type": "Sensor",
+  "scope": "/garden",
+  "temperature": {
+    "type": "Property",
+    "value": 10,
+    "observedAt": "2026-10-20T22:02:00Z"
+  }
+}
+
+{
+  "id": "urn:ngsi-ld:Sensor:s2",
+  "type": "Sensor",
+  "scope": "/garden",
+  "temperature": {
+    "type": "Property",
+    "value": 11,
+    "observedAt": "2026-10-20T22:02:00Z"
+  }
+}
+
+
+
+06. The errors - no group, a group's devices but not this one, a group with a key and no value, an empty value - nothing stored (18)
+====================================================================================================================================
+{"name":"DEVICE_GROUP_NOT_FOUND","message":"Couldn't find device group for apikey nokey"}
+404
+{"name":"DEVICE_NOT_FOUND","message":"No device was found with id:th9 and apikey th-key"}
+404
+{"name":"PARSE_ERROR","message":"There was a syntax error in the Ultralight request: Parsing group:h"}
+400
+{"name":"PARSE_ERROR","message":"There was a syntax error in the Ultralight request: Parsing group:t|99|h|"}
+400
+    "value": 18,
+
+
+07. MQTT - /<apikey>/<deviceId>/attrs (UltraLight), ul/<apikey>/<deviceId>/attrs/<name> (one value, a string)
+=============================================================================================================
+    "value": 5,
+    "observedAt": "2026-10-20T23:00:00Z"
+  "scope": "/garden",
+    "value": 7,
+    "value": "all fine",
+
+
